@@ -111,6 +111,13 @@ class MACBlock(nn.Module):
     ) -> tuple[torch.Tensor, MemoryState]:
         """Forward pass for MAC block.
 
+        Following the paper (Section 4.1, Eq. 21-25):
+        1. h_t = M*_{t-1}(q_t) - Retrieve from memory using input as query (Eq. 21)
+        2. S̃^(t) = [persistent] || h_t || x - Concatenate (Eq. 22)
+        3. y_t = Attn(S̃^(t)) - Attention (Eq. 23)
+        4. M_t = M_{t-1}(y_t) - Update memory with attention output (Eq. 24)
+        5. o_t = y_t ⊗ M*_t(y_t) - Final output (Eq. 25)
+
         Args:
             x: Input tensor (batch, seq, dim) - single chunk/segment
             state: Memory state from previous chunk
@@ -120,24 +127,38 @@ class MACBlock(nn.Module):
         """
         batch_size, seq_len, _ = x.shape
 
+        # Initialize memory state if needed
+        if state is None:
+            state = self.memory.init_state(batch_size, x.device)
+
+        # Step 1 (Eq. 21): Retrieve from memory using input as query
+        # h_t = M*_{t-1}(q_t) - forward pass without weight update
+        memory_retrieved = self.memory.retrieve(x, state)
+        memory_tokens = self.norm_mem(memory_retrieved)
+
         # Get persistent memory tokens
         persistent = self.persistent(batch_size)
 
-        # Retrieve from long-term memory and update it
-        memory_out, new_state = self.memory(x, state=state)
-        memory_tokens = self.norm_mem(memory_out)
-
-        # Attention with persistent + memory + input
+        # Steps 2-3 (Eq. 22-23): Attention with [persistent || memory || input]
         normed = self.norm1(x)
         attn_out = self.attention(normed, persistent=persistent, memory=memory_tokens)
-        x = x + self.dropout(attn_out)
+        y_t = x + self.dropout(attn_out)  # y_t is the attention output
+
+        # Step 4 (Eq. 24): Update memory with attention output
+        # M_t = M_{t-1}(y_t) - this updates memory weights
+        _, new_state = self.memory(y_t, state=state)
+
+        # Step 5 (Eq. 25): Final output o_t = y_t ⊗ M*_t(y_t)
+        # Retrieve from updated memory
+        mem_out = self.memory.retrieve(y_t, new_state)
+        output = y_t * mem_out  # Element-wise product
 
         # Feed-forward
-        normed = self.norm2(x)
+        normed = self.norm2(output)
         ffn_out = self.ffn(normed)
-        x = x + self.dropout(ffn_out)
+        output = output + self.dropout(ffn_out)
 
-        return x, new_state
+        return output, new_state
 
 
 class TitansMAC(nn.Module):
@@ -234,10 +255,10 @@ class TitansMAC(nn.Module):
 class MAGBlock(nn.Module):
     """Memory as Gate Block.
 
-    Architecture:
-    1. Sliding window attention (short-term memory)
-    2. Long-term memory in parallel
-    3. Combine via gating: output = y ⊗ M(x)
+    Architecture (Section 4.2, Eq. 26-28):
+    1. y_t = Attn(x) - Sliding window attention (Eq. 26)
+    2. M_t = M_{t-1}(x_t) - Update memory with input (Eq. 27)
+    3. o_t = y_t ⊗ M*_t(x_t) - Element-wise product (Eq. 28)
 
     The attention handles precise local dependencies,
     while memory provides fading long-range context.
@@ -256,18 +277,12 @@ class MAGBlock(nn.Module):
         # Long-term memory
         self.memory = NeuralLongTermMemory(config)
 
-        # Gating projections (for combining attention and memory)
-        self.gate_attn = nn.Linear(config.dim, config.dim, bias=False)
-        self.gate_mem = nn.Linear(config.dim, config.dim, bias=False)
-
         # Feed-forward
         self.ffn = FeedForward(config)
 
         # Layer norms
         self.norm1 = RMSNorm(config.dim)
         self.norm2 = RMSNorm(config.dim)
-        self.norm_attn = RMSNorm(config.dim)
-        self.norm_mem = RMSNorm(config.dim)
 
         # Dropout
         self.dropout = nn.Dropout(config.dropout)
@@ -279,6 +294,11 @@ class MAGBlock(nn.Module):
     ) -> tuple[torch.Tensor, MemoryState]:
         """Forward pass for MAG block.
 
+        Following the paper (Section 4.2, Eq. 26-28):
+        1. y_t = Attn(x) - Attention on input (Eq. 26)
+        2. M_t = M_{t-1}(x_t) - Update memory with input (Eq. 27)
+        3. o_t = y_t ⊗ M*_t(x_t) - Output is element-wise product (Eq. 28)
+
         Args:
             x: Input tensor (batch, seq, dim)
             state: Memory state
@@ -288,34 +308,27 @@ class MAGBlock(nn.Module):
         """
         batch_size = x.shape[0]
 
-        # Get persistent memory
+        # Get persistent memory as prefix for attention
         persistent = self.persistent(batch_size)
 
-        # Build prefix for attention
-        prefix = persistent
-
-        # Attention branch
+        # Eq. 26: y_t = Attn(x) - Attention branch
         normed = self.norm1(x)
-        attn_out = self.attention(normed, prefix=prefix)
-        attn_out = self.norm_attn(attn_out)
+        attn_out = self.attention(normed, prefix=persistent)
+        y_t = x + self.dropout(attn_out)
 
-        # Memory branch
+        # Eq. 27: M_t = M_{t-1}(x_t) - Memory update with input
         mem_out, new_state = self.memory(normed, state=state)
-        mem_out = self.norm_mem(mem_out)
 
-        # Gating combination: o = y ⊗ M(x)
-        gate_a = torch.sigmoid(self.gate_attn(attn_out))
-        gate_m = torch.sigmoid(self.gate_mem(mem_out))
-        combined = gate_a * attn_out + gate_m * mem_out
-
-        x = x + self.dropout(combined)
+        # Eq. 28: o_t = y_t ⊗ M*_t(x_t) - Element-wise product
+        # Use memory output (which is M*(x)) as the gate
+        output = y_t * mem_out
 
         # Feed-forward
-        normed = self.norm2(x)
+        normed = self.norm2(output)
         ffn_out = self.ffn(normed)
-        x = x + self.dropout(ffn_out)
+        output = output + self.dropout(ffn_out)
 
-        return x, new_state
+        return output, new_state
 
 
 class TitansMAG(nn.Module):

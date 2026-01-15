@@ -5,14 +5,31 @@
 """
 Pretraining script for Titans models.
 
+Supports:
+- HuggingFace tokenizers (LLaMA 2, GPT-2, etc.)
+- HuggingFace datasets (FineWeb-Edu, etc.) with streaming
+- Mixed precision training (fp16/bf16)
+- Gradient accumulation for large effective batch sizes
+- Cosine annealing with warmup
+- Weights & Biases logging (optional)
+- Multi-GPU with Accelerate (optional)
+
 Usage:
+    # Demo with synthetic data
     uv run python scripts/pretrain.py --model mac --dim 256 --epochs 10
 
-    # With custom data
+    # Train with FineWeb-Edu (streaming)
+    uv run python scripts/pretrain.py --model mac --dataset HuggingFaceFW/fineweb-edu \\
+        --tokenizer meta-llama/Llama-2-7b-hf --dim 512 --num-layers 12
+
+    # Train with local text file
     uv run python scripts/pretrain.py --model mag --data path/to/data.txt
 
     # Resume from checkpoint
     uv run python scripts/pretrain.py --model mac --resume checkpoints/latest.pt
+
+    # With wandb logging
+    uv run python scripts/pretrain.py --model mac --wandb --wandb-project titans
 """
 
 from __future__ import annotations
@@ -21,14 +38,39 @@ import argparse
 import logging
 import math
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
 from titans import TitansConfig, TitansLMM, TitansMAC, TitansMAG, TitansMAL
+
+# Optional imports
+try:
+    from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    PreTrainedTokenizerBase = Any  # type: ignore
+
+try:
+    from datasets import load_dataset
+
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+
+try:
+    import wandb
+
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,24 +79,67 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-class TextDataset(Dataset):
-    """Simple text dataset for language modeling."""
+# =============================================================================
+# Training Configuration
+# =============================================================================
 
-    def __init__(
-        self,
-        data: torch.Tensor,
-        seq_len: int,
-    ) -> None:
-        self.data = data
-        self.seq_len = seq_len
 
-    def __len__(self) -> int:
-        return max(0, len(self.data) - self.seq_len)
+@dataclass
+class TrainingConfig:
+    """Training hyperparameters following the paper (Section 5.1)."""
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        x = self.data[idx : idx + self.seq_len]
-        y = self.data[idx + 1 : idx + self.seq_len + 1]
-        return {"input_ids": x, "labels": y}
+    # Model
+    model_type: str = "mac"
+    dim: int = 512
+    num_heads: int = 8
+    num_layers: int = 12
+    vocab_size: int = 32000
+    chunk_size: int = 512
+    window_size: int = 512
+    num_persistent_tokens: int = 16
+    num_memory_layers: int = 2
+
+    # Data
+    dataset: str | None = None  # HuggingFace dataset name
+    dataset_subset: str | None = None  # Dataset subset/config
+    data_path: str | None = None  # Local text file
+    tokenizer: str = "gpt2"  # HuggingFace tokenizer
+    seq_len: int = 4096  # Paper uses 4K
+
+    # Training (following paper Section 5.1)
+    epochs: int = 1
+    max_steps: int = -1  # -1 = use epochs
+    batch_size: int = 4  # Per-device batch size
+    gradient_accumulation_steps: int = 32  # Effective batch ~0.5M tokens
+    lr: float = 4e-4  # Paper: 4e-4
+    weight_decay: float = 0.1  # Paper: 0.1
+    grad_clip: float = 1.0
+    warmup_ratio: float = 0.03
+
+    # Mixed precision
+    mixed_precision: str = "bf16"  # none, fp16, bf16
+
+    # Checkpointing
+    checkpoint_dir: str = "checkpoints"
+    save_every: int = 1000  # Save every N steps
+    eval_every: int = 500  # Evaluate every N steps
+    resume: str | None = None
+
+    # Logging
+    log_every: int = 10
+    wandb: bool = False
+    wandb_project: str = "titans"
+    wandb_run_name: str | None = None
+
+    # Other
+    seed: int = 42
+    num_workers: int = 4
+    synthetic_samples: int = 10000  # For demo mode
+
+
+# =============================================================================
+# Datasets
+# =============================================================================
 
 
 class SyntheticDataset(Dataset):
@@ -71,7 +156,6 @@ class SyntheticDataset(Dataset):
         self.seq_len = seq_len
         self.num_samples = num_samples
 
-        # Generate reproducible synthetic data
         generator = torch.Generator().manual_seed(seed)
         self.data = torch.randint(
             0, vocab_size, (num_samples, seq_len + 1), generator=generator
@@ -87,10 +171,115 @@ class SyntheticDataset(Dataset):
         }
 
 
-def create_model(
-    model_type: str,
-    config: TitansConfig,
-) -> nn.Module:
+class TextFileDataset(Dataset):
+    """Dataset from a local text file with HuggingFace tokenizer."""
+
+    def __init__(
+        self,
+        path: Path,
+        tokenizer: PreTrainedTokenizerBase,
+        seq_len: int,
+    ) -> None:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+
+        self.tokens = tokenizer.encode(text, add_special_tokens=False)
+        self.tokens = torch.tensor(self.tokens, dtype=torch.long)
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return max(0, len(self.tokens) - self.seq_len)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        x = self.tokens[idx : idx + self.seq_len]
+        y = self.tokens[idx + 1 : idx + self.seq_len + 1]
+        return {"input_ids": x, "labels": y}
+
+
+class CharLevelDataset(Dataset):
+    """Simple character-level dataset (fallback when no tokenizer)."""
+
+    def __init__(
+        self,
+        path: Path,
+        vocab_size: int,
+        seq_len: int,
+    ) -> None:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+
+        chars = sorted(set(text))
+        char_to_idx = {c: i % vocab_size for i, c in enumerate(chars)}
+        self.tokens = torch.tensor(
+            [char_to_idx.get(c, 0) for c in text], dtype=torch.long
+        )
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return max(0, len(self.tokens) - self.seq_len)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        x = self.tokens[idx : idx + self.seq_len]
+        y = self.tokens[idx + 1 : idx + self.seq_len + 1]
+        return {"input_ids": x, "labels": y}
+
+
+class StreamingDataset(IterableDataset):
+    """Streaming dataset from HuggingFace datasets."""
+
+    def __init__(
+        self,
+        dataset_name: str,
+        tokenizer: PreTrainedTokenizerBase,
+        seq_len: int,
+        subset: str | None = None,
+        split: str = "train",
+        seed: int = 42,
+    ) -> None:
+        self.dataset_name = dataset_name
+        self.tokenizer = tokenizer
+        self.seq_len = seq_len
+        self.subset = subset
+        self.split = split
+        self.seed = seed
+
+    def __iter__(self):
+        # Load dataset in streaming mode
+        ds = load_dataset(
+            self.dataset_name,
+            self.subset,
+            split=self.split,
+            streaming=True,
+            trust_remote_code=True,
+        )
+        ds = ds.shuffle(seed=self.seed, buffer_size=10000)
+
+        buffer = []
+        for example in ds:
+            # Get text from example (try common field names)
+            text = example.get("text") or example.get("content") or str(example)
+
+            # Tokenize
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            buffer.extend(tokens)
+
+            # Yield complete sequences
+            while len(buffer) >= self.seq_len + 1:
+                chunk = buffer[: self.seq_len + 1]
+                buffer = buffer[self.seq_len :]  # Overlap by 1 for next prediction
+
+                yield {
+                    "input_ids": torch.tensor(chunk[:-1], dtype=torch.long),
+                    "labels": torch.tensor(chunk[1:], dtype=torch.long),
+                }
+
+
+# =============================================================================
+# Model Creation
+# =============================================================================
+
+
+def create_model(model_type: str, config: TitansConfig) -> nn.Module:
     """Create Titans model based on type."""
     models = {
         "mac": TitansMAC,
@@ -105,378 +294,618 @@ def create_model(
     return models[model_type](config)
 
 
-def load_text_data(path: Path, vocab_size: int) -> torch.Tensor:
-    """Load text file and convert to token IDs."""
-    with open(path, encoding="utf-8") as f:
-        text = f.read()
-
-    # Simple character-level tokenization for demo
-    chars = sorted(set(text))
-    char_to_idx = {c: i % vocab_size for i, c in enumerate(chars)}
-
-    tokens = torch.tensor([char_to_idx.get(c, 0) for c in text], dtype=torch.long)
-    return tokens
+def count_parameters(model: nn.Module) -> tuple[int, int]:
+    """Count total and trainable parameters."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 
-def train_epoch(
-    model: nn.Module,
-    dataloader: DataLoader,
+# =============================================================================
+# Learning Rate Scheduler
+# =============================================================================
+
+
+def get_cosine_schedule_with_warmup(
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-    device: torch.device,
-    epoch: int,
-    grad_clip: float = 1.0,
-) -> dict[str, float]:
-    """Train for one epoch."""
-    model.train()
-    total_loss = 0.0
-    total_tokens = 0
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.1,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Cosine annealing with linear warmup (as used in the paper)."""
 
-    pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
+    def lr_lambda(current_step: int) -> float:
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
 
-    for batch in pbar:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-
-        optimizer.zero_grad()
-
-        # Forward pass
-        logits, _ = model(input_ids)
-
-        # Compute loss
-        loss = nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
+        progress = float(current_step - num_warmup_steps) / float(
+            max(1, num_training_steps - num_warmup_steps)
         )
+        return max(min_lr_ratio, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+# =============================================================================
+# Training Loop
+# =============================================================================
+
+
+class Trainer:
+    """Training loop with mixed precision and gradient accumulation."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        config: TrainingConfig,
+        train_dataloader: DataLoader,
+        val_dataloader: DataLoader | None = None,
+        device: torch.device | None = None,
+    ) -> None:
+        self.model = model
+        self.config = config
+        self.train_dataloader = train_dataloader
+        self.val_dataloader = val_dataloader
+
+        # Device
+        if device is None:
+            if torch.cuda.is_available():
+                device = torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                device = torch.device("mps")
+            else:
+                device = torch.device("cpu")
+        self.device = device
+        self.model = self.model.to(self.device)
+
+        # Optimizer (AdamW as in paper)
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.95),  # Common for LLMs
+        )
+
+        # Calculate total steps
+        if config.max_steps > 0:
+            self.total_steps = config.max_steps
+        else:
+            steps_per_epoch = (
+                len(train_dataloader) // config.gradient_accumulation_steps
+            )
+            self.total_steps = steps_per_epoch * config.epochs
+
+        # Scheduler
+        num_warmup_steps = int(self.total_steps * config.warmup_ratio)
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer, num_warmup_steps, self.total_steps
+        )
+
+        # Mixed precision
+        self.scaler = None
+        self.autocast_dtype = None
+        if config.mixed_precision == "fp16" and self.device.type == "cuda":
+            self.scaler = torch.amp.GradScaler("cuda")
+            self.autocast_dtype = torch.float16
+        elif config.mixed_precision == "bf16":
+            self.autocast_dtype = torch.bfloat16
+
+        # State
+        self.global_step = 0
+        self.epoch = 0
+        self.best_val_loss = float("inf")
+
+        # Checkpoint directory
+        self.checkpoint_dir = Path(config.checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Wandb
+        if config.wandb and HAS_WANDB:
+            wandb.init(
+                project=config.wandb_project,
+                name=config.wandb_run_name,
+                config=vars(config),
+            )
+
+    def train_step(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Single training step with mixed precision."""
+        input_ids = batch["input_ids"].to(self.device)
+        labels = batch["labels"].to(self.device)
+
+        # Forward pass with autocast
+        if self.autocast_dtype is not None:
+            with torch.autocast(
+                device_type=self.device.type, dtype=self.autocast_dtype
+            ):
+                logits, _ = self.model(input_ids)
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                )
+        else:
+            logits, _ = self.model(input_ids)
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+            )
+
+        # Scale loss for gradient accumulation
+        scaled_loss = loss / self.config.gradient_accumulation_steps
 
         # Backward pass
-        loss.backward()
+        if self.scaler is not None:
+            self.scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
+
+        return loss, {"loss": loss.item(), "ppl": math.exp(loss.item())}
+
+    def optimizer_step(self) -> None:
+        """Optimizer step with gradient clipping and scaling."""
+        if self.scaler is not None:
+            self.scaler.unscale_(self.optimizer)
 
         # Gradient clipping
-        if grad_clip > 0:
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        if self.config.grad_clip > 0:
+            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.grad_clip)
 
-        optimizer.step()
+        # Optimizer step
+        if self.scaler is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            self.optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+        self.global_step += 1
 
-        # Accumulate metrics
-        batch_tokens = labels.numel()
-        total_loss += loss.item() * batch_tokens
-        total_tokens += batch_tokens
+    @torch.no_grad()
+    def evaluate(self) -> dict[str, float]:
+        """Evaluate on validation set."""
+        if self.val_dataloader is None:
+            return {}
 
-        # Update progress bar
-        avg_loss = total_loss / total_tokens
-        pbar.set_postfix(
-            {"loss": f"{avg_loss:.4f}", "ppl": f"{math.exp(avg_loss):.2f}"}
-        )
+        self.model.eval()
+        total_loss = 0.0
+        total_tokens = 0
 
-    return {
-        "loss": total_loss / total_tokens,
-        "perplexity": math.exp(total_loss / total_tokens),
-    }
+        for batch in tqdm(self.val_dataloader, desc="Evaluating", leave=False):
+            input_ids = batch["input_ids"].to(self.device)
+            labels = batch["labels"].to(self.device)
+
+            if self.autocast_dtype is not None:
+                with torch.autocast(
+                    device_type=self.device.type, dtype=self.autocast_dtype
+                ):
+                    logits, _ = self.model(input_ids)
+                    loss = nn.functional.cross_entropy(
+                        logits.view(-1, logits.size(-1)),
+                        labels.view(-1),
+                    )
+            else:
+                logits, _ = self.model(input_ids)
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    labels.view(-1),
+                )
+
+            batch_tokens = labels.numel()
+            total_loss += loss.item() * batch_tokens
+            total_tokens += batch_tokens
+
+        self.model.train()
+
+        avg_loss = total_loss / total_tokens if total_tokens > 0 else 0
+        return {"val_loss": avg_loss, "val_ppl": math.exp(avg_loss)}
+
+    def save_checkpoint(self, name: str = "checkpoint") -> Path:
+        """Save training checkpoint."""
+        path = self.checkpoint_dir / f"{name}.pt"
+        checkpoint = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict() if self.scaler else None,
+            "global_step": self.global_step,
+            "epoch": self.epoch,
+            "best_val_loss": self.best_val_loss,
+            "config": vars(self.config),
+        }
+        torch.save(checkpoint, path)
+        logger.info(f"Saved checkpoint to {path}")
+        return path
+
+    def load_checkpoint(self, path: Path) -> None:
+        """Load training checkpoint."""
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        if self.scaler and checkpoint["scaler_state_dict"]:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
+        self.global_step = checkpoint["global_step"]
+        self.epoch = checkpoint["epoch"]
+        self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        logger.info(f"Loaded checkpoint from {path} (step {self.global_step})")
+
+    def train(self) -> None:
+        """Main training loop."""
+        self.model.train()
+        self.optimizer.zero_grad()
+
+        accumulation_step = 0
+        running_loss = 0.0
+        running_count = 0
+
+        start_time = time.time()
+        pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="Training")
+
+        while self.global_step < self.total_steps:
+            self.epoch += 1
+
+            for batch in self.train_dataloader:
+                if self.global_step >= self.total_steps:
+                    break
+
+                # Training step
+                loss, metrics = self.train_step(batch)
+                running_loss += metrics["loss"]
+                running_count += 1
+                accumulation_step += 1
+
+                # Optimizer step after accumulation
+                if accumulation_step >= self.config.gradient_accumulation_steps:
+                    self.optimizer_step()
+                    accumulation_step = 0
+
+                    # Logging
+                    if self.global_step % self.config.log_every == 0:
+                        avg_loss = running_loss / running_count
+                        current_lr = self.scheduler.get_last_lr()[0]
+
+                        log_dict = {
+                            "train/loss": avg_loss,
+                            "train/ppl": math.exp(avg_loss),
+                            "train/lr": current_lr,
+                            "train/step": self.global_step,
+                        }
+
+                        pbar.set_postfix(
+                            {
+                                "loss": f"{avg_loss:.4f}",
+                                "ppl": f"{math.exp(avg_loss):.2f}",
+                                "lr": f"{current_lr:.2e}",
+                            }
+                        )
+
+                        if self.config.wandb and HAS_WANDB:
+                            wandb.log(log_dict, step=self.global_step)
+
+                        running_loss = 0.0
+                        running_count = 0
+
+                    # Evaluation
+                    if (
+                        self.config.eval_every > 0
+                        and self.global_step % self.config.eval_every == 0
+                    ):
+                        val_metrics = self.evaluate()
+                        if val_metrics:
+                            logger.info(
+                                f"Step {self.global_step}: "
+                                f"val_loss={val_metrics['val_loss']:.4f}, "
+                                f"val_ppl={val_metrics['val_ppl']:.2f}"
+                            )
+
+                            if self.config.wandb and HAS_WANDB:
+                                wandb.log(
+                                    {f"val/{k}": v for k, v in val_metrics.items()},
+                                    step=self.global_step,
+                                )
+
+                            # Save best model
+                            if val_metrics["val_loss"] < self.best_val_loss:
+                                self.best_val_loss = val_metrics["val_loss"]
+                                self.save_checkpoint("best_model")
+
+                    # Periodic checkpoint
+                    if (
+                        self.config.save_every > 0
+                        and self.global_step % self.config.save_every == 0
+                    ):
+                        self.save_checkpoint(f"step_{self.global_step}")
+
+                    pbar.update(1)
+
+        pbar.close()
+
+        # Final checkpoint
+        self.save_checkpoint("final_model")
+
+        elapsed = time.time() - start_time
+        logger.info(f"Training completed in {elapsed / 3600:.2f} hours")
+        logger.info(f"Total steps: {self.global_step}")
+        logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+
+        if self.config.wandb and HAS_WANDB:
+            wandb.finish()
 
 
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    dataloader: DataLoader,
-    device: torch.device,
-) -> dict[str, float]:
-    """Evaluate model on validation set."""
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-
-    for batch in tqdm(dataloader, desc="Evaluating"):
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-
-        logits, _ = model(input_ids)
-
-        loss = nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            labels.view(-1),
-        )
-
-        batch_tokens = labels.numel()
-        total_loss += loss.item() * batch_tokens
-        total_tokens += batch_tokens
-
-    avg_loss = total_loss / total_tokens
-    return {
-        "loss": avg_loss,
-        "perplexity": math.exp(avg_loss),
-    }
-
-
-def save_checkpoint(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-    epoch: int,
-    config: TitansConfig,
-    model_type: str,
-    path: Path,
-) -> None:
-    """Save training checkpoint."""
-    checkpoint = {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-        "epoch": epoch,
-        "config": config.__dict__,
-        "model_type": model_type,
-    }
-    torch.save(checkpoint, path)
-    logger.info(f"Saved checkpoint to {path}")
-
-
-def load_checkpoint(
-    path: Path,
-    device: torch.device,
-) -> dict:
-    """Load training checkpoint."""
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    logger.info(f"Loaded checkpoint from {path}")
-    return checkpoint
+# =============================================================================
+# Main
+# =============================================================================
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pretrain Titans models")
+    parser = argparse.ArgumentParser(
+        description="Pretrain Titans models",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
 
-    # Model arguments
+    # Model
     parser.add_argument(
         "--model",
         type=str,
         default="mac",
         choices=["mac", "mag", "mal", "lmm"],
-        help="Model variant to train",
+        help="Model variant",
     )
-    parser.add_argument("--dim", type=int, default=256, help="Model dimension")
+    parser.add_argument("--dim", type=int, default=512, help="Model dimension")
+    parser.add_argument("--num-heads", type=int, default=8, help="Attention heads")
+    parser.add_argument("--num-layers", type=int, default=12, help="Number of layers")
+    parser.add_argument("--vocab-size", type=int, default=32000, help="Vocabulary size")
+    parser.add_argument("--chunk-size", type=int, default=512, help="Chunk size (MAC)")
     parser.add_argument(
-        "--num-heads", type=int, default=8, help="Number of attention heads"
-    )
-    parser.add_argument("--num-layers", type=int, default=4, help="Number of layers")
-    parser.add_argument("--vocab-size", type=int, default=256, help="Vocabulary size")
-    parser.add_argument(
-        "--chunk-size", type=int, default=128, help="Chunk size for MAC"
-    )
-    parser.add_argument(
-        "--window-size", type=int, default=128, help="Window size for MAG/MAL"
+        "--window-size", type=int, default=512, help="Window size (MAG/MAL)"
     )
 
-    # Data arguments
-    parser.add_argument("--data", type=str, default=None, help="Path to text data file")
-    parser.add_argument("--seq-len", type=int, default=256, help="Sequence length")
+    # Data
     parser.add_argument(
-        "--synthetic-samples",
+        "--dataset",
+        type=str,
+        default=None,
+        help="HuggingFace dataset (e.g., HuggingFaceFW/fineweb-edu)",
+    )
+    parser.add_argument(
+        "--dataset-subset", type=str, default=None, help="Dataset subset"
+    )
+    parser.add_argument("--data", type=str, default=None, help="Local text file path")
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default="gpt2",
+        help="HuggingFace tokenizer (e.g., meta-llama/Llama-2-7b-hf)",
+    )
+    parser.add_argument("--seq-len", type=int, default=4096, help="Sequence length")
+
+    # Training
+    parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
+    parser.add_argument(
+        "--max-steps", type=int, default=-1, help="Max steps (-1=epochs)"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=4, help="Batch size per device"
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
         type=int,
-        default=10000,
-        help="Synthetic samples if no data",
+        default=32,
+        help="Gradient accumulation",
     )
-
-    # Training arguments
-    parser.add_argument("--epochs", type=int, default=10, help="Number of epochs")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    parser.add_argument("--weight-decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--lr", type=float, default=4e-4, help="Learning rate")
+    parser.add_argument("--weight-decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument(
         "--grad-clip", type=float, default=1.0, help="Gradient clipping"
     )
-    parser.add_argument("--warmup-steps", type=int, default=100, help="Warmup steps")
+    parser.add_argument("--warmup-ratio", type=float, default=0.03, help="Warmup ratio")
 
-    # Checkpoint arguments
+    # Mixed precision
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        default="bf16",
+        choices=["none", "fp16", "bf16"],
+        help="Mixed precision mode",
+    )
+
+    # Checkpointing
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    parser.add_argument(
+        "--save-every", type=int, default=1000, help="Save every N steps"
+    )
+    parser.add_argument(
+        "--eval-every", type=int, default=500, help="Eval every N steps"
+    )
     parser.add_argument(
         "--resume", type=str, default=None, help="Resume from checkpoint"
     )
-    parser.add_argument(
-        "--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory"
-    )
-    parser.add_argument(
-        "--save-every", type=int, default=1, help="Save checkpoint every N epochs"
-    )
 
-    # Device arguments
-    parser.add_argument(
-        "--device", type=str, default="auto", help="Device (auto, cpu, cuda, mps)"
-    )
+    # Logging
+    parser.add_argument("--log-every", type=int, default=10, help="Log every N steps")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb-project", type=str, default="titans")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+
+    # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
+    parser.add_argument(
+        "--synthetic-samples", type=int, default=10000, help="Synthetic samples (demo)"
+    )
 
     args = parser.parse_args()
 
     # Set random seed
     torch.manual_seed(args.seed)
 
-    # Select device
-    if args.device == "auto":
-        if torch.cuda.is_available():
-            device = torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            device = torch.device("mps")
-        else:
-            device = torch.device("cpu")
-    else:
-        device = torch.device(args.device)
-
-    logger.info(f"Using device: {device}")
-
-    # Create config
-    config = TitansConfig(
+    # Build config
+    config = TrainingConfig(
+        model_type=args.model,
         dim=args.dim,
         num_heads=args.num_heads,
         num_layers=args.num_layers,
         vocab_size=args.vocab_size,
         chunk_size=args.chunk_size,
         window_size=args.window_size,
-        dropout=0.1,
-        num_persistent_tokens=8,
-        num_memory_layers=2,
+        dataset=args.dataset,
+        dataset_subset=args.dataset_subset,
+        data_path=args.data,
+        tokenizer=args.tokenizer,
+        seq_len=args.seq_len,
+        epochs=args.epochs,
+        max_steps=args.max_steps,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        grad_clip=args.grad_clip,
+        warmup_ratio=args.warmup_ratio,
+        mixed_precision=args.mixed_precision,
+        checkpoint_dir=args.checkpoint_dir,
+        save_every=args.save_every,
+        eval_every=args.eval_every,
+        resume=args.resume,
+        log_every=args.log_every,
+        wandb=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        synthetic_samples=args.synthetic_samples,
+    )
+
+    # Check dependencies
+    if config.dataset and not HAS_DATASETS:
+        logger.error(
+            "Install 'datasets' for HuggingFace datasets: pip install datasets"
+        )
+        return
+
+    if config.wandb and not HAS_WANDB:
+        logger.warning("wandb not installed, disabling logging")
+        config.wandb = False
+
+    # Load tokenizer
+    tokenizer = None
+    if HAS_TRANSFORMERS and (config.dataset or config.data_path):
+        logger.info(f"Loading tokenizer: {config.tokenizer}")
+        tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        config.vocab_size = tokenizer.vocab_size
+        logger.info(f"Tokenizer vocab size: {config.vocab_size}")
+
+    # Create model config
+    model_config = TitansConfig(
+        dim=config.dim,
+        num_heads=config.num_heads,
+        num_layers=config.num_layers,
+        vocab_size=config.vocab_size,
+        chunk_size=config.chunk_size,
+        window_size=config.window_size,
+        num_persistent_tokens=config.num_persistent_tokens,
+        num_memory_layers=config.num_memory_layers,
+        dropout=0.0,  # Usually 0 for pretraining
     )
 
     # Create model
-    model = create_model(args.model, config)
-    model = model.to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logger.info(f"Model: {args.model.upper()}")
-    logger.info(f"Total parameters: {total_params:,}")
+    model = create_model(config.model_type, model_config)
+    total_params, trainable_params = count_parameters(model)
+    logger.info(f"Model: Titans{config.model_type.upper()}")
+    logger.info(f"Total parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
     logger.info(f"Trainable parameters: {trainable_params:,}")
 
     # Create dataset
-    if args.data:
-        data = load_text_data(Path(args.data), args.vocab_size)
-        train_size = int(0.9 * len(data))
-        train_data = data[:train_size]
-        val_data = data[train_size:]
+    train_dataset: Dataset | IterableDataset
+    val_dataset: Dataset | None = None
 
-        train_dataset = TextDataset(train_data, args.seq_len)
-        val_dataset = TextDataset(val_data, args.seq_len)
+    if config.dataset:
+        # HuggingFace streaming dataset
+        logger.info(f"Using HuggingFace dataset: {config.dataset}")
+        if tokenizer is None:
+            raise ValueError("Tokenizer required for HuggingFace datasets")
+
+        train_dataset = StreamingDataset(
+            config.dataset,
+            tokenizer,
+            config.seq_len,
+            subset=config.dataset_subset,
+            split="train",
+            seed=config.seed,
+        )
+        # Note: validation requires non-streaming dataset or separate split
+
+    elif config.data_path:
+        # Local text file
+        logger.info(f"Loading data from: {config.data_path}")
+        path = Path(config.data_path)
+
+        if tokenizer is not None:
+            full_dataset = TextFileDataset(path, tokenizer, config.seq_len)
+        else:
+            full_dataset = CharLevelDataset(path, config.vocab_size, config.seq_len)
+
+        # Split into train/val
+        train_size = int(0.95 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size]
+        )
+        logger.info(f"Train samples: {train_size}, Val samples: {val_size}")
+
     else:
-        logger.info("Using synthetic data for demo")
+        # Synthetic data (demo)
+        logger.info("Using synthetic data (demo mode)")
         train_dataset = SyntheticDataset(
-            args.vocab_size, args.seq_len, args.synthetic_samples, seed=args.seed
+            config.vocab_size, config.seq_len, config.synthetic_samples, config.seed
         )
         val_dataset = SyntheticDataset(
-            args.vocab_size,
-            args.seq_len,
-            args.synthetic_samples // 10,
-            seed=args.seed + 1,
+            config.vocab_size,
+            config.seq_len,
+            config.synthetic_samples // 10,
+            config.seed + 1,
         )
 
+    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,
+        batch_size=config.batch_size,
+        shuffle=not isinstance(train_dataset, IterableDataset),
+        num_workers=config.num_workers
+        if not isinstance(train_dataset, IterableDataset)
+        else 0,
+        pin_memory=True,
     )
 
-    logger.info(f"Train samples: {len(train_dataset)}")
-    logger.info(f"Val samples: {len(val_dataset)}")
-
-    # Create optimizer and scheduler
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    total_steps = len(train_loader) * args.epochs
-    warmup_pct = min(args.warmup_steps / total_steps, 0.3) if total_steps > 0 else 0.1
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=args.lr,
-        total_steps=total_steps,
-        pct_start=warmup_pct,
-    )
-
-    # Resume from checkpoint if specified
-    start_epoch = 1
-    if args.resume:
-        checkpoint = load_checkpoint(Path(args.resume), device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if checkpoint["scheduler_state_dict"]:
-            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-
-    # Create checkpoint directory
-    checkpoint_dir = Path(args.checkpoint_dir)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Training loop
-    best_val_loss = float("inf")
-    start_time = time.time()
-
-    for epoch in range(start_epoch, args.epochs + 1):
-        logger.info(f"\n{'=' * 50}")
-        logger.info(f"Epoch {epoch}/{args.epochs}")
-        logger.info(f"{'=' * 50}")
-
-        # Train
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch, args.grad_clip
-        )
-        logger.info(
-            f"Train - Loss: {train_metrics['loss']:.4f}, PPL: {train_metrics['perplexity']:.2f}"
+    val_loader = None
+    if val_dataset is not None:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
         )
 
-        # Evaluate
-        val_metrics = evaluate(model, val_loader, device)
-        logger.info(
-            f"Val - Loss: {val_metrics['loss']:.4f}, PPL: {val_metrics['perplexity']:.2f}"
-        )
-
-        # Save checkpoint
-        if epoch % args.save_every == 0:
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                config,
-                args.model,
-                checkpoint_dir / f"checkpoint_epoch_{epoch}.pt",
-            )
-
-        # Save best model
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            save_checkpoint(
-                model,
-                optimizer,
-                scheduler,
-                epoch,
-                config,
-                args.model,
-                checkpoint_dir / "best_model.pt",
-            )
-            logger.info(f"New best model! Val loss: {best_val_loss:.4f}")
-
-    # Save final model
-    save_checkpoint(
-        model,
-        optimizer,
-        scheduler,
-        args.epochs,
-        config,
-        args.model,
-        checkpoint_dir / "final_model.pt",
+    # Log effective batch size
+    effective_batch_size = (
+        config.batch_size * config.gradient_accumulation_steps * config.seq_len
     )
+    logger.info(f"Effective batch size: {effective_batch_size:,} tokens")
+    logger.info(f"Sequence length: {config.seq_len}")
+    logger.info(f"Mixed precision: {config.mixed_precision}")
 
-    elapsed = time.time() - start_time
-    logger.info(f"\nTraining completed in {elapsed:.2f}s")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    logger.info(f"Best validation perplexity: {math.exp(best_val_loss):.2f}")
+    # Create trainer
+    trainer = Trainer(model, config, train_loader, val_loader)
+
+    # Resume if specified
+    if config.resume:
+        trainer.load_checkpoint(Path(config.resume))
+
+    # Train
+    trainer.train()
 
 
 if __name__ == "__main__":

@@ -33,6 +33,15 @@ dev = [
     "mypy>=1.8",
     "ruff>=0.2",
 ]
+train = [
+    "transformers>=4.36.0",
+    "datasets>=2.16.0",
+    "wandb>=0.16.0",
+    "accelerate>=0.25.0",
+]
+all = [
+    "titans[dev,train]",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -69,7 +78,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["torch.*"]
+module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -235,10 +235,6 @@ class NeuralLongTermMemory(nn.Module):
         # Output projection
         self.proj_out = nn.Linear(config.dim, config.dim, bias=False)
 
-        # Layer normalization for queries and keys (following paper)
-        self.norm_q = nn.LayerNorm(config.dim)
-        self.norm_k = nn.LayerNorm(config.dim)
-
         # Initialize
         self._init_weights()
 
@@ -379,14 +375,14 @@ class NeuralLongTermMemory(nn.Module):
         # Apply convolution
         k, v, q = self._apply_conv(k, v, q)
 
-        # Apply SiLU activation (following paper)
+        # Apply SiLU activation (following paper Section 4.4)
         k = F.silu(k)
         v = F.silu(v)
         q = F.silu(q)
 
-        # Normalize queries and keys (L2 norm as in paper)
-        q = self.norm_q(q)
-        k = self.norm_k(k)
+        # Normalize queries and keys using L2-norm (Section 4.4)
+        q = F.normalize(q, p=2, dim=-1)
+        k = F.normalize(k, p=2, dim=-1)
 
         # Retrieve from memory using queries
         # y_t = M*(q_t) - forward pass without weight update
@@ -452,7 +448,7 @@ class NeuralLongTermMemory(nn.Module):
             q = rearrange(q, "b d s -> b s d")
 
         q = F.silu(q)
-        q = self.norm_q(q)
+        q = F.normalize(q, p=2, dim=-1)
 
         # Retrieve
         retrieved = self.memory(q)
