@@ -48,8 +48,11 @@ flash = [
 triton = [
     "triton>=2.1.0",
 ]
+mlx = [
+    "mlx>=0.18.0",
+]
 all = [
-    "titans[dev,train,hub,flash,triton]",
+    "titans[dev,train,hub,flash,triton,mlx]",
 ]
 
 [build-system]
@@ -77,7 +80,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["titans"]
+known-first-party = ["titans", "titans_mlx"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -87,7 +90,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*", "flash_attn.*", "triton.*", "huggingface_hub.*", "bitsandbytes.*"]
+module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*", "flash_attn.*", "triton.*", "huggingface_hub.*", "bitsandbytes.*", "mlx.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -97,6 +100,7 @@ addopts = "-v --tb=short"
 [dependency-groups]
 dev = [
     "mypy>=1.19.1",
+    "numpy>=2.4.1",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
     "ruff>=0.14.9",
