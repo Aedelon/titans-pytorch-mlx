@@ -46,6 +46,17 @@ from titans_mlx.optimizations import (
     rotary_embedding_optimized,
     scaled_dot_product_attention,
 )
+from titans_mlx.metal_kernels import (
+    benchmark_metal_kernel,
+    get_metal_kernel_info,
+    metal_causal_attention,
+    metal_memory_update,
+    metal_rope,
+    metal_silu_gate,
+    MetalFeedForward,
+    MetalRMSNorm,
+    MetalRotaryEmbedding,
+)
 
 __version__ = "0.1.0"
 __all__ = [
@@ -78,4 +89,14 @@ __all__ = [
     "OptimizedMemoryMLP",
     "rotary_embedding_optimized",
     "scaled_dot_product_attention",
+    # Metal Kernels
+    "benchmark_metal_kernel",
+    "get_metal_kernel_info",
+    "metal_causal_attention",
+    "metal_memory_update",
+    "metal_rope",
+    "metal_silu_gate",
+    "MetalFeedForward",
+    "MetalRMSNorm",
+    "MetalRotaryEmbedding",
 ]
