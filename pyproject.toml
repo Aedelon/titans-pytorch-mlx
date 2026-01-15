@@ -39,8 +39,17 @@ train = [
     "wandb>=0.16.0",
     "accelerate>=0.25.0",
 ]
+hub = [
+    "huggingface_hub>=0.20.0",
+]
+flash = [
+    "flash-attn>=2.5.0",
+]
+triton = [
+    "triton>=2.1.0",
+]
 all = [
-    "titans[dev,train]",
+    "titans[dev,train,hub,flash,triton]",
 ]
 
 [build-system]
@@ -78,7 +87,7 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*"]
+module = ["torch.*", "transformers.*", "datasets.*", "wandb.*", "accelerate.*", "flash_attn.*", "triton.*", "huggingface_hub.*", "bitsandbytes.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

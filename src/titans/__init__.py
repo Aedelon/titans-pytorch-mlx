@@ -15,16 +15,29 @@ Reference:
     arXiv preprint arXiv:2501.00663
 """
 
-from titans.attention import SegmentedAttention, SlidingWindowAttention
+# Core modules (no circular dependencies)
 from titans.config import TitansConfig
 from titans.memory import MemoryState, NeuralLongTermMemory
+from titans.persistent import PersistentMemory
+from titans.attention import SegmentedAttention, SlidingWindowAttention
 from titans.models import (
     TitansLMM,
     TitansMAC,
     TitansMAG,
     TitansMAL,
 )
-from titans.persistent import PersistentMemory
+
+# Optional modules (may have circular dependencies, import lazily)
+from titans.flash_attention import (
+    FlashSegmentedAttention,
+    FlashSlidingWindowAttention,
+    is_flash_attention_available,
+    is_torch_sdpa_available,
+)
+from titans.triton_kernels import is_triton_available
+
+# Hub must be imported after models to avoid circular imports
+from titans.hub import load_from_hub, push_to_hub
 
 __version__ = "0.1.0"
 __author__ = "Delanoe Pirard / Aedelon"
@@ -39,6 +52,16 @@ __all__ = [
     # Attention
     "SlidingWindowAttention",
     "SegmentedAttention",
+    # Flash Attention
+    "FlashSlidingWindowAttention",
+    "FlashSegmentedAttention",
+    "is_flash_attention_available",
+    "is_torch_sdpa_available",
+    # Triton
+    "is_triton_available",
+    # Hub
+    "push_to_hub",
+    "load_from_hub",
     # Persistent Memory
     "PersistentMemory",
     # Models
