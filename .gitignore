@@ -48,13 +48,30 @@ Thumbs.db
 
 # Checkpoints
 checkpoints/
+checkpoints_mlx/
 *.pt
 *.pth
 *.ckpt
+*.safetensors
 
 # Logs
 *.log
 logs/
+wandb/
+
+# Papers / PDFs
+*.pdf
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Data
+data/
+datasets/
+*.bin
+*.jsonl
+
+# Secrets
+.env
+.env.*
+secrets.yaml
