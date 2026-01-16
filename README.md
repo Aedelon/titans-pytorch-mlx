@@ -1000,4 +1000,4 @@ uv run ruff format src/ tests/ scripts/
 
 Apache License 2.0
 
-Copyright (c) 2024 Delanoe Pirard / Aedelon
+Copyright (c) 2026 Delanoe Pirard / Aedelon
